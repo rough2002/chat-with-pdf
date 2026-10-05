@@ -1,14 +1,15 @@
-from fastapi import FastAPI,UploadFile
+from fastapi import FastAPI, HTTPException,UploadFile
 from fastapi.responses import StreamingResponse
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import fitz
 import os,time
 from pinecone import Pinecone,SchemaBuilder
 from pydantic import BaseModel
-
-
+from supabase_client import supabase
+from utils import count_tokens , trim_history
 
 
 
@@ -108,51 +109,113 @@ def uploadPdfFile(file : UploadFile) :
 
 class ChatRequest(BaseModel):
     question:str
-    filename:str
+    conversation_id : str | None = None
 
+ROLE_MAP = {"User": "user", "LLM": "model"}
+
+SYSTEM_INSTRUCTION = """
+Answer only from the provided context.
+The earlier conversation is only there to help you understand what the user refers to.
+If the answer is not in the context, say "I don't know based on the provided document."
+"""
 
 @app.post("/chat")
-async def chat(req : ChatRequest):
-    question_embedding = client.models.embed_content(model="gemini-embedding-2",
-            contents=req.question,config=genai.types.EmbedContentConfig(output_dimensionality=1024))
+def chat(req: ChatRequest):
+    # 1. get or create the conversation
+    if not req.conversation_id:
+        res = supabase.table("conversation").insert({}).execute()
+        conversation_id = res.data[0]["id"]
+        history = []
+    else:
+        conversation_id = req.conversation_id
+        res = (
+            supabase.table("conversation")
+            .select("id, created_at, message(id, created_at, role, message)")
+            .eq("id", conversation_id)
+            .order("created_at", desc=False, foreign_table="message")
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        history = res.data[0]["message"]
 
-    search_results = index.documents.search(     namespace="__default__",
-    top_k=5,
-    score_by=[{
-        "type": "dense_vector",
-        "field": "embedding",  # ← "field" not "fields", and it's a string not a list
-        "values": question_embedding.embeddings[0].values
-    }],
-    include_fields=["*"],
-    filter={"filename": {"$eq": req.filename}})
+    # 2. trim history to the token budget
+    recent_history = trim_history(history)
 
-    context = ""
+    # 3. rewrite the question if there is history
+    search_query = req.question
+    if recent_history:
+        convo_text = "\n".join(f'{m["role"]}: {m["message"]}' for m in recent_history)
+        rewrite_prompt = (
+            "Given the conversation and the follow-up question, rewrite the "
+            "follow-up as a standalone question. Return only the question.\n\n"
+            f"Conversation:\n{convo_text}\n\nFollow-up: {req.question}"
+        )
+        rewrite = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=rewrite_prompt,
+        )
+        search_query = rewrite.text.strip()
 
-    for match in search_results.matches : 
-        context += match.text + "\n\n"
+    # 4. retrieve with the rewritten question
+    question_embedding = client.models.embed_content(
+        model="gemini-embedding-2",
+        contents=search_query,
+        config=types.EmbedContentConfig(output_dimensionality=1024),
+    )
+    search_results = index.documents.search(
+        namespace="__default__",
+        top_k=5,
+        score_by=[{
+            "type": "dense_vector",
+            "field": "embedding",
+            "values": question_embedding.embeddings[0].values,
+        }],
+        include_fields=["*"],
+    )
+    context = "\n\n".join(match.text for match in search_results.matches)
 
-    prompt = f"""
-    You are a helpful assistant. Answer the question based only on the context provided below.
-    If the answer is not in the context, say "I don't know based on the provided document."
+    # 5. build messages: history + (context + new question)
+    llm_messages = [
+        types.Content(role=ROLE_MAP[m["role"]], parts=[types.Part(text=m["message"])])
+        for m in recent_history
+    ]
+    llm_messages.append(
+        types.Content(
+            role="user",
+            parts=[types.Part(text=f"Context:\n{context}\n\nQuestion: {req.question}")],
+        )
+    )
 
-    Context:
-    {context}
-
-    Question: {req.question}
-    """
-
-
+    # 6. stream the answer, then save both messages
     def stream_response():
-     for chunk in client.models.generate_content_stream(
-        model="gemini-3.1-flash-lite",
-        contents=prompt
-     ):
-        if chunk.text:
-            print("CHUNK:", repr(chunk.text))
-            yield chunk.text
-            time.sleep(1)
+        full_answer = ""
+        for chunk in client.models.generate_content_stream(
+            model="gemini-3.1-flash-lite",
+            contents=llm_messages,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+        ):
+            if chunk.text:
+                full_answer += chunk.text
+                yield chunk.text
+
+        supabase.table("message").insert([
+            {"conversation_id": conversation_id, "role": "User", "message": req.question},
+            {"conversation_id": conversation_id, "role": "LLM", "message": full_answer},
+        ]).execute()
 
     return StreamingResponse(
         stream_response(),
-        media_type="text/plain"
+        media_type="text/plain",
+        headers={"X-Conversation-Id": str(conversation_id)},
     )
+
+# @app.get("/test-db")
+# async def test():
+#     conversation_id = None
+#     # if not conversation_id :
+#     #      conversation_id =  supabase.table("conversation").insert({}).select("id").execute()
+#     resposne =   supabase.table("conversation").select("id, created_at, message(id, created_at, role, message)").eq("id", 1).order("created_at", desc=False, foreign_table="message").execute()
+#     print(resposne)
+#     return {"data" : resposne.data,}
+    
